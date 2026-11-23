@@ -8,8 +8,9 @@ adapted for my workflow, including Forgejo support and model choices.
 Each skill has its own folder with instructions and any scripts, references, or
 assets it needs. The catalog links open the skill instructions.
 
-Forgejo is the main repository for this collection. A public GitHub mirror is
-planned so the skills can be read without logging in.
+Forgejo is the main repository for this collection. The
+[public GitHub mirror](https://github.com/bedar89/skills) lets you read the skills
+without logging in.
 
 [Use a skill](#use-a-skill) · [Browse the collection](#browse-the-collection) ·
 [Install](#install) · [Make changes](#make-changes)
@@ -188,7 +189,7 @@ check tools for that policy.
 ## Make changes
 
 If you have access to the main Forgejo repository, make changes and open pull
-requests there. Once available, use the GitHub mirror for reading. Keep mirror credentials
+requests there. Use the GitHub mirror for reading. Keep mirror credentials
 outside Git.
 
 Edit skills in [skills/](skills/) directly. Keep changes within the requested
