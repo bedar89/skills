@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""Watch a Forgejo PR through an existing authenticated tea login.
+
+forgejo-pr-wait <pr> --login <tea-login> [--repo owner/name]
+        [--until ready|green|any-change] [--interval 20]
+
+Numbers resolve against origin; URLs use /owner/repo/pulls/index.
+Use the full PR URL when the instance uses a non-default HTTPS port.
+The login's returned PR URL must match the target instance.
+Only GET requests are made. State and one process lock per login/repo/PR
+live under ~/.local/state/forgejo-pr-wait. Only new events are reported.
+After upgrading old c:<id> event keys, earlier comments or reviews can replay
+once because their object types were ambiguous. Re-read the PR before acting.
+
+Exit 0: requested condition reached, or PR merged.
+Exit 1: failed checks, conflicts, outdated base, unresolved comments,
+        missing approvals, draft, changed head/base, or unreadable API.
+Exit 2: invalid arguments or another watcher already owns this PR.
+
+Green means stable exact-head required contexts passed. Without configured
+requirements, reported ordinary CI contexts gate and recognized reviewbot contexts
+are excluded. An empty set can pass after two stable polls. Explicitly required
+contexts always gate; missing required contexts remain pending.
+Ready also requires effective current-head official approvals, no rejected
+reviews or unresolved comments, and a current mergeable non-draft branch.
+Repository-specific bot completion and the complete merge gate still need
+independent verification before merging.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, NoReturn
+from urllib.parse import quote, urlsplit
+
+GATING_BOTS: tuple[str, ...] = ()
+ADVISORY_BOTS = ("coderabbit",)
+# CI and deploy bots report through checks. Their PR comments are status reports.
+STATUS_BOTS = ("forgejo-actions",)
+LOGIN = ""
+TARGET_HOST = ""
+STATE_DIR = Path.home() / ".local" / "state" / "forgejo-pr-wait"
+STALE_STATE_SECONDS = 6 * 3600
+MAX_FAILED_POLLS = 10
+TRANSIENT = re.compile(
+    r"HTTP (5\d\d|429)|rate limit|timed? ?out|connection (reset|refused)|EOF|"
+    r"temporar|could not resolve host|TLS handshake|Something went wrong",
+    re.IGNORECASE,
+)
+FAILED = ("fail", "cancel")
+
+Json = dict[str, Any]
+
+
+class ForgejoError(Exception):
+    def __init__(self, message: str, transient: bool) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+def log(message: str) -> None:
+    print(f"forgejo-pr-wait: {message}", file=sys.stderr, flush=True)
+
+
+def fail(message: str, code: int = 2) -> NoReturn:
+    print(f"forgejo-pr-wait: {message}", flush=True)
+    sys.exit(code)
+
+
+def api(endpoint: str, repo: str | None = None) -> Any:
+    args = ["tea", "api", "--login", LOGIN]
+    if repo:
+        args += ["--repo", repo]
+    proc = subprocess.run([*args, endpoint], capture_output=True, text=True)
+    if proc.returncode:
+        # Do not print CLI stderr, which can contain authentication details.
+        raise ForgejoError(f"Forgejo GET failed: {endpoint.split('?')[0]}", False)
+    try:
+        return json.loads(proc.stdout)
+    except ValueError as error:
+        raise ForgejoError("Forgejo returned invalid JSON", False) from error
+
+
+def pages(endpoint: str, repo: str) -> list[Json]:
+    rows: list[Json] = []
+    page = 1
+    while True:
+        batch = api(f"{endpoint}?limit=50&page={page}", repo)
+        if not isinstance(batch, list):
+            raise ForgejoError("Expected a paginated Forgejo list", False)
+        rows.extend(batch)
+        if not batch:
+            return rows
+        page += 1
+
+
+def bot_name(text: str | None) -> str | None:
+    lowered = (text or "").lower()
+    return next((bot for bot in GATING_BOTS + ADVISORY_BOTS if bot in lowered), None)
+
+
+def who(node: Json) -> tuple[str, bool]:
+    author = node.get("author") or {}
+    return author.get("login") or "ghost", author.get("is_bot", False)
+
+
+def plain(body: str) -> str:
+    body = re.sub(r"<!--.*?-->", " ", body or "", flags=re.DOTALL)
+    return html.unescape(re.sub(r"<[^>]+>", " ", body))
+
+
+def snippet(body: str, limit: int = 100) -> str:
+    text = re.sub(r"\s+", " ", plain(body)).strip()
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def verdict(body: str) -> str:
+    for line in plain(body).splitlines():
+        if re.search(r"verdict|confidence score", line, re.IGNORECASE):
+            return snippet(line.replace("*", ""), 80)
+    return ""
+
+
+def digest(body: str) -> str:
+    return hashlib.sha1(re.sub(r"\s+", " ", plain(body)).encode()).hexdigest()[:12]
+
+
+def parse_target(raw: str | None, repo: str | None) -> tuple[str, int]:
+    global TARGET_HOST
+    if not raw:
+        fail("missing PR number or Forgejo PR URL")
+    url = re.fullmatch(r"https?://([^/\s]+)/([^/\s]+/[^/\s]+)/pulls/(\d+)(?:[/?#]\S*)?", raw)
+    if url:
+        if repo and repo != url.group(2):
+            fail("--repo conflicts with the PR URL")
+        TARGET_HOST, repo, number = url.group(1), url.group(2), url.group(3)
+    else:
+        number = raw.lstrip("#")
+        remote = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True)
+        match = re.fullmatch(r"(?:ssh://(?:[^@/]+@)?|https?://)([^/:]+)(?::\d+)?/(.+?)(?:\.git)?\s*", remote.stdout)
+        if not match:
+            match = re.fullmatch(r"(?:[^@]+@)?([^:]+):(.+?)(?:\.git)?\s*", remote.stdout)
+        if not match:
+            fail("Use a Forgejo PR URL outside a checkout with an origin remote")
+        TARGET_HOST = match.group(1)
+        repo = repo or match.group(2)
+    if not number.isdigit() or int(number) < 1 or not repo or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        fail("Expected a positive PR number and owner/name repository")
+    return repo, int(number)
+
+
+def lock(repo: str, pr: int) -> Any:
+    """Hold a per-PR lock for the life of the process. The OS drops it on exit."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(STATE_DIR / f"{hashlib.sha256((LOGIN + ':' + repo).encode()).hexdigest()[:24]}__{pr}.lock", "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        pid = handle.read().strip() or "unknown"
+        fail(
+            f"pid {pid} already watches {repo}#{pr}, so this watcher exits to avoid "
+            f"duplicate events. If no events reach you from it, run `kill {pid}` and start again."
+        )
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
+class Watcher:
+    def __init__(self, repo: str, pr: int, until: str, interval: int) -> None:
+        self.repo, self.pr, self.until, self.interval = repo, pr, until, interval
+        self.owner, self.name = repo.split("/")
+        self.path = STATE_DIR / f"{hashlib.sha256((LOGIN + ':' + repo).encode()).hexdigest()[:24]}__{pr}.json"
+        state = self.load()
+        self.baseline = state is None
+        self.state: Json = state or {"reported": [], "summaries": {}, "base_oid": None, "merge_state": None}
+        self.reported: set[str] = set(self.state["reported"])
+        self.printed: set[str] = set()
+        self.events = 0
+        self.required: set[str] | None = None
+        self.prev_snapshot: tuple[Any, ...] | None = None
+        self.pr_files: dict[str, set[str]] = {}
+
+    def load(self) -> Json | None:
+        try:
+            if time.time() - self.path.stat().st_mtime > STALE_STATE_SECONDS:
+                return None
+            return json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def save(self) -> None:
+        self.state["reported"] = sorted(self.reported)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.state))
+        tmp.replace(self.path)
+
+    def say(self, line: str) -> None:
+        if line not in self.printed:
+            self.printed.add(line)
+            print(f"#{self.pr} {line}", flush=True)
+
+    def emit(self, key: str, line: str) -> None:
+        if key in self.reported:
+            return
+        self.reported.add(key)
+        if not self.baseline:
+            self.events += 1
+            self.say(line)
+
+    def finish(self, code: int, lines: Sequence[str] = ()) -> NoReturn:
+        if code == 0 and any(line.startswith(("green on", "ready on")) for line in lines):
+            current = api(f"repos/{self.repo}/pulls/{self.pr}", self.repo)
+            if self.pr_identity(current) != self.qualified_pr:
+                code, lines = 1, ["PR state, target, head or base changed during verification; restart the watcher"]
+            else:
+                expected_gate, expected_feedback = self.required, self.qualified_feedback
+                confirmed = self.fetch_pr(current)
+                if self.required != expected_gate:
+                    code, lines = 1, ["Required checks changed during verification; restart the watcher"]
+                elif any(line.startswith("ready on") for line in lines) and (
+                        not self.review_ready or self.review_feedback(confirmed) != expected_feedback):
+                    code, lines = 1, ["PR review feedback changed during verification; restart the watcher"]
+                elif self.checks_snapshot(self.fetch_checks()) != self.qualified_checks:
+                    code, lines = 1, ["Check results changed during verification; restart the watcher"]
+                elif self.pr_identity(api(f"repos/{self.repo}/pulls/{self.pr}", self.repo)) != self.qualified_pr:
+                    code, lines = 1, ["PR changed during verification of check results; restart the watcher"]
+        for line in lines:
+            self.say(line)
+        self.save()
+        sys.exit(code)
+
+    @staticmethod
+    def pr_identity(pr: Json) -> tuple[Any, ...]:
+        return (pr["head"]["sha"], pr["base"]["sha"], pr["base"]["ref"],
+                pr["state"], pr["merged"], pr.get("draft", False), pr.get("mergeable"))
+
+    @staticmethod
+    def review_feedback(pr: Json) -> tuple[Any, ...]:
+        return (pr["comments"], pr["reviews"], pr["reviewThreads"])
+
+    def fetch_pr(self, pr: Json | None = None) -> Json:
+        prefix = f"repos/{self.repo}"
+        if pr is None:
+            pr = api(f"{prefix}/pulls/{self.pr}", self.repo)
+        if urlsplit(pr["html_url"]).netloc != TARGET_HOST:
+            raise ForgejoError("tea login targets a different Forgejo instance", False)
+        self.qualified_pr = self.pr_identity(pr)
+        head, base = pr["head"]["sha"], pr["base"]["ref"]
+        self.head = head
+        self.checks_repo = self.repo
+        branch = api(f"{prefix}/branches/{quote(base, safe='')}", self.repo)
+        self.required = set(branch["status_check_contexts"] or []) if branch["enable_status_check"] else set()
+        reviews = pages(f"{prefix}/pulls/{self.pr}/reviews", self.repo)
+        comments = pages(f"{prefix}/issues/{self.pr}/comments", self.repo)
+        def node(row: Json) -> Json:
+            return {"id": str(row["id"]), "url": row.get("html_url", pr["html_url"]),
+                    "body": row.get("body") or "", "author": row.get("user") or {}}
+        threads = []
+        normalized_reviews = []
+        latest: dict[str, Json] = {}
+        for review in sorted(reviews, key=lambda row: row["id"]):
+            normalized_reviews.append({**node(review), "state": "CHANGES_REQUESTED" if review["state"] == "REQUEST_CHANGES" else review["state"], "commit": {"oid": review["commit_id"]}})
+            if not review.get("dismissed") and review["state"] in ("APPROVED", "REQUEST_CHANGES"):
+                latest[review["user"]["login"]] = review
+            for comment in pages(f"{prefix}/pulls/{self.pr}/reviews/{review['id']}/comments", self.repo):
+                threads.append({"isResolved": bool(comment.get("resolver")), "path": comment["path"],
+                                "line": comment["position"], "comments": {"nodes": [node(comment)]}})
+        approvals = sum(r["state"] == "APPROVED" and r["commit_id"] == head and r.get("official", False)
+                        and not r.get("stale", False) for r in latest.values())
+        self.review_ready = approvals >= branch["required_approvals"] and not any(
+            r["state"] == "REQUEST_CHANGES" for r in latest.values())
+        base_sha = pr["base"]["sha"]
+        comparison = api(f"{prefix}/compare/{head}...{base_sha}", self.repo)
+        behind = comparison["total_commits"]
+        state = "MERGED" if pr["merged"] else pr["state"].upper()
+        merge_state = "DIRTY" if pr.get("mergeable") is False else "BEHIND" if behind else "CLEAN" if pr.get("mergeable") is True else "UNKNOWN"
+        self.review_ready = self.review_ready and not pr.get("draft", False) and merge_state == "CLEAN"
+        return {"url": pr["html_url"], "state": state, "headRefOid": head, "baseRefName": base,
+                "author": pr["user"], "viewer": api("user", self.repo)["login"],
+                "baseRef": {"target": {"oid": base_sha}}, "mergeStateStatus": merge_state,
+                "comments": {"nodes": [node(c) for c in comments]},
+                "reviews": {"nodes": normalized_reviews}, "reviewThreads": {"nodes": threads}}
+
+    def checks_snapshot(self, checks: dict[str, Json]) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted((name, row["bucket"]) for name, row in checks.items()
+                            if name in (self.required or ()) or bot_name(name) not in ADVISORY_BOTS))
+
+    def fetch_checks(self) -> dict[str, Json]:
+        rows = pages(f"repos/{self.checks_repo}/commits/{self.head}/statuses", self.repo)
+        checks = {}
+        # Forgejo returns newest statuses first. Previous failures of the same
+        # context are history, not a failure of the current run.
+        for row in rows:
+            name = row["context"]
+            if name not in checks:
+                checks[name] = {"name": name, "bucket": {"success": "pass", "failure": "fail", "error": "fail"}.get(row["status"], "pending"),
+                                "link": row.get("target_url") or "", "description": row.get("description") or ""}
+        return checks
+
+    def base_overlap(self, head: str, old: str, new: str) -> list[str]:
+        if head not in self.pr_files:
+            self.pr_files[head] = {row["filename"] for row in pages(f"repos/{self.repo}/pulls/{self.pr}/files", self.repo)}
+        moved = api(f"repos/{self.repo}/compare/{old}...{new}", self.repo)
+        return sorted(self.pr_files[head].intersection(row["filename"] for row in moved["files"]))
+
+    def behind(self, base: str, base_oid: str | None, head: str) -> str:
+        return ""
+
+    def poll(self) -> None:
+        pr = self.fetch_pr()
+        self.qualified_feedback = self.review_feedback(pr)
+        if pr["state"] == "MERGED":
+            self.finish(0, [f"merged: {pr['url']}"])
+        if pr["state"] == "CLOSED":
+            self.finish(1, [f"closed without merging: {pr['url']}"])
+
+        base = pr["baseRefName"]
+        if self.required is None:
+            raise ForgejoError("Missing effective branch protection", False)
+        checks = self.fetch_checks()
+        head = pr["headRefOid"]
+        short = head[:7]
+        mine = {who(pr)[0], pr["viewer"]}
+        comments = pr["comments"]["nodes"]
+        reviews = pr["reviews"]["nodes"]
+        threads = pr["reviewThreads"]["nodes"]
+        self.events = 0
+
+        gate = self.required or {name for name in checks if not bot_name(name)}
+        label = "required check" if self.required else "check"
+
+        def bucket(name: str) -> str:
+            return checks[name]["bucket"] if name in checks else "pending"
+
+        fail_lines: list[str] = []
+        for name in sorted(gate):
+            if bucket(name) in FAILED:
+                link = checks[name]["link"]
+                fail_lines.append(f"{label} failed: {name} {link}")
+                self.emit(f"fail:{head}:{name}:{link}", fail_lines[-1])
+        watched = {name: c for name, c in checks.items() if name in self.required or bot_name(name) not in ADVISORY_BOTS}
+        gate_done = all(bucket(n) != "pending" for n in gate)
+        all_done = gate_done and all(c["bucket"] != "pending" for c in watched.values())
+        # Checks appear a few seconds after a push. Two identical polls in a row
+        # guard against calling a half-registered set of checks finished.
+        self.qualified_checks = self.checks_snapshot(checks)
+        snapshot = (self.qualified_pr, frozenset(self.required), self.qualified_checks)
+        stable = snapshot == self.prev_snapshot
+        self.prev_snapshot = snapshot
+        green = gate_done and stable and not fail_lines
+
+        for comment in comments:
+            login, is_bot = who(comment)
+            if login in mine or bot_name(login) or (is_bot and any(b in login for b in STATUS_BOTS)):
+                continue
+            self.emit(f"issue-comment:{comment['id']}", f"comment from {login}: {snippet(comment['body'])} {comment['url']}")
+        for review in reviews:
+            login, is_bot = who(review)
+            if login in mine or is_bot:
+                continue
+            if review["state"] in ("APPROVED", "CHANGES_REQUESTED") or review["body"].strip():
+                state = review["state"].lower().replace("_", " ")
+                self.emit(f"review:{review['id']}", f"review from {login} ({state}): {snippet(review['body'])} {review['url']}")
+        unresolved: list[str] = []
+        for thread in threads:
+            nodes = thread["comments"]["nodes"]
+            if not thread["isResolved"] and nodes:
+                unresolved.append(nodes[0]["url"])
+            where = f"{thread['path']}:{thread['line']}" if thread["line"] else thread["path"]
+            for index, comment in enumerate(nodes):
+                login, _ = who(comment)
+                if login in mine:
+                    continue
+                kind = "new thread" if index == 0 else "thread reply"
+                self.emit(f"review-comment:{comment['id']}", f"{kind} from {login} on {where}: {snippet(comment['body'])} {comment['url']}")
+
+        bot_status: dict[str, str] = {}
+        reviewed: list[str] = []
+        for bot in GATING_BOTS + ADVISORY_BOTS:
+            own_checks = {name: c for name, c in checks.items() if bot_name(name) == bot}
+            required_bot_checks = any(name in self.required for name in own_checks)
+            summaries = [c for c in comments if bot_name(who(c)[0]) == bot]
+            own_reviews = [r for r in reviews if bot_name(who(r)[0]) == bot]
+            on_head = any((r.get("commit") or {}).get("oid") == head for r in own_reviews)
+            if own_checks:
+                done = all(c["bucket"] != "pending" for c in own_checks.values())
+            else:
+                done = on_head or any(short in s["body"] for s in summaries)
+            seen = bool(own_checks or summaries or own_reviews)
+            if bot in ADVISORY_BOTS and own_checks:
+                desc = next(iter(own_checks.values()))
+                role = "required check; review advisory" if required_bot_checks else "advisory"
+                bot_status[bot] = f"{bot} {desc['description'] or desc['bucket']} ({role})"
+            elif seen:
+                bot_status[bot] = f"{bot} {'done' if done else 'pending'}{' (advisory)' if bot in ADVISORY_BOTS else ''}"
+            key = f"bot:{bot}:{head}"
+            was_done = key in self.reported
+            if done:
+                if bot in GATING_BOTS:
+                    reviewed.append(bot)
+                failed = [name for name, c in own_checks.items() if c["bucket"] in FAILED]
+                detail = "; ".join(filter(None, [
+                    next((v for v in map(verdict, (s["body"] for s in summaries)) if v), ""),
+                    f"failed: {', '.join(failed)}" if failed else "",
+                ]))
+                tag = (" (required check; review advisory)" if required_bot_checks else " (advisory, not waited on)") if bot in ADVISORY_BOTS else ""
+                self.emit(key, f"{bot} finished on {short}{': ' + detail if detail else ''}{tag}")
+            if bot in GATING_BOTS:
+                for s in summaries:
+                    new, old = digest(s["body"]), self.state["summaries"].get(s["id"])
+                    self.state["summaries"][s["id"]] = new
+                    if was_done and old and old != new:
+                        text = verdict(s["body"]) or snippet(s["body"])
+                        self.emit(f"summary:{s['id']}:{new}", f"{bot} summary changed on {short}: {text} {s['url']}")
+
+        base_oid = ((pr.get("baseRef") or {}).get("target") or {}).get("oid")
+        old_base = self.state["base_oid"]
+        if base_oid and old_base and base_oid != old_base and not self.baseline:
+            touched = self.base_overlap(head, old_base, base_oid)
+            if touched:
+                more = f" and {len(touched) - 5} more" if len(touched) > 5 else ""
+                self.emit(
+                    f"base:{base_oid}",
+                    f"{base} moved to {base_oid[:7]} and touches files in this PR: {', '.join(touched[:5])}{more}",
+                )
+        if base_oid:
+            self.state["base_oid"] = base_oid
+        merge_state = pr["mergeStateStatus"]
+        dirty_line = f"merge state is DIRTY: the branch conflicts with {base}, rebase it"
+        behind_line = f"merge state is BEHIND: update the branch from {base} before merging"
+        if merge_state != "UNKNOWN":
+            if merge_state in ("BEHIND", "DIRTY") and self.state["merge_state"] != merge_state:
+                line = dirty_line if merge_state == "DIRTY" else behind_line
+                self.emit(f"merge:{merge_state}:{head}:{base_oid}", line)
+            self.state["merge_state"] = merge_state
+
+        counts: dict[str, int] = {}
+        for c in watched.values():
+            counts[c["bucket"]] = counts.get(c["bucket"], 0) + 1
+        failed_names = sorted(name for name, c in watched.items() if c["bucket"] in FAILED)
+        parts = [
+            ", ".join(f"{n} {b}" for b, n in sorted(counts.items()))
+            + (f" ({', '.join(failed_names)})" if failed_names else ""),
+            f"required {sum(bucket(n) in ('pass', 'skipping') for n in self.required)}/{len(self.required)} green"
+            if self.required
+            else "",
+            ", ".join(bot_status[b] for b in GATING_BOTS + ADVISORY_BOTS if b in bot_status)
+            or "repository-specific bot reviews require manual verification",
+            f"{len(unresolved)} unresolved threads",
+            f"merge state {merge_state}",
+        ]
+        summary = "; ".join(p for p in parts if p)
+        checks_key = f"checks:{head}"
+
+        if self.until != "any-change":
+            if merge_state == "DIRTY":
+                self.finish(1, [dirty_line])
+            if fail_lines:
+                self.finish(1, fail_lines)
+            if green and self.until == "green":
+                self.reported.add(checks_key)
+                self.finish(0, [f"green on {short}: {summary}{self.behind(base, base_oid, head)}"])
+            if green and self.until == "ready":
+                if merge_state == "BEHIND":
+                    self.finish(1, [behind_line])
+                if not self.review_ready:
+                    self.finish(1, ["checks green; mergeability, draft state or required reviews need attention"])
+                if unresolved:
+                    self.finish(1, [f"blocked by {len(unresolved)} unresolved threads on {short}: {' '.join(unresolved)}"])
+                self.reported.add(checks_key)
+                self.finish(0, [f"ready on {short}: {summary}{self.behind(base, base_oid, head)}"])
+        if all_done and (stable or self.baseline):
+            self.emit(checks_key, f"checks finished on {short}: {summary}")
+        if self.until == "any-change" and self.events:
+            self.finish(0)
+
+    def run(self) -> NoReturn:
+        failures = 0
+        while True:
+            try:
+                self.poll()
+                failures = 0
+            except ForgejoError as error:
+                if not error.transient:
+                    self.finish(1, [f"forgejo-pr-wait stopped: {error}"])
+                failures += 1
+                log(f"poll failed ({failures}/{MAX_FAILED_POLLS}): {error}")
+                if failures >= MAX_FAILED_POLLS:
+                    self.finish(1, [f"forgejo-pr-wait stopped: Forgejo unreachable for {failures} polls: {error}"])
+            else:
+                self.save()
+                if self.baseline:
+                    log(f"baseline recorded for {self.repo}#{self.pr}; reporting only new events")
+                self.baseline = False
+            time.sleep(self.interval)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="forgejo-pr-wait", description="Watch a Forgejo PR and print one line per real event.")
+    parser.add_argument("--login", required=True, help="Authenticated tea login for this Forgejo instance")
+    parser.add_argument("pr", nargs="?", help="PR number or URL")
+    parser.add_argument("--repo", help="owner/name (default: from the URL or the current checkout)")
+    parser.add_argument("--until", choices=("green", "ready", "any-change"), default="ready")
+    parser.add_argument("--interval", type=int, default=20, help="seconds between polls (default 20, min 5)")
+    args = parser.parse_args()
+    global LOGIN
+    LOGIN = args.login
+    repo, pr = parse_target(args.pr, args.repo)
+    _lock = lock(repo, pr)
+    Watcher(repo, pr, args.until, max(args.interval, 5)).run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

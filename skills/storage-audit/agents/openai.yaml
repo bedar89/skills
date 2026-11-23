@@ -1,0 +1,4 @@
+interface:
+  display_name: "Storage audit"
+  short_description: "Measure complete app footprints and review storage recovery."
+  default_prompt: "Use $storage-audit to inspect storage, app data and use evidence, then show cleanup proposals without deleting anything."

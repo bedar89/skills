@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="nl" data-lavish-annotate="off"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Opslagonderzoek</title>
+<style>
+:root{color-scheme:light dark;--ink:var(--foreground,light-dark(#182821,#edf3ee));--paper:var(--card,light-dark(#f2f6f3,#1b2922));--line:var(--border,light-dark(#d1ddd5,#3b4f42));--green:var(--chart-1,#398566);--radius:12px}
+*{box-sizing:border-box;min-width:0}body{margin:0;color:var(--ink);font:15px/1.55 var(--font-sans,system-ui,sans-serif)}main{max-width:1100px;margin:auto}h1{font-size:30px;line-height:1.15;margin:12px 0}h2{font-size:21px;margin:28px 0 12px}h3{font-size:17px;margin:0}.eyebrow{font-size:12px;letter-spacing:.1em;text-transform:uppercase}.muted,small{opacity:.75}p{margin:8px 0 16px}.panel,details{background:var(--paper);padding:18px;border:1px solid var(--line);border-radius:var(--radius);margin:12px 0}summary{cursor:pointer;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,230px),1fr));gap:12px}.metric{font-size:27px;font-weight:650}.bar{height:9px;background:var(--line);border-radius:9px;overflow:hidden;margin:10px 0}.bar>span{display:block;background:var(--green);height:9px}input[type=search],select,button,textarea{font:inherit;color:inherit;border:1px solid var(--line);border-radius:8px;background:var(--paper);padding:10px}input[type=search]{width:100%}button{cursor:pointer}button:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid var(--green);outline-offset:2px}.tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.tools>*{flex:1}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:9px 6px;vertical-align:top;border-bottom:1px solid var(--line);overflow-wrap:anywhere}th:last-child,td:last-child{text-align:right}code{font:12px var(--font-mono,monospace);overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;max-height:380px;overflow:auto}.tag{font-size:12px;border:1px solid var(--line);border-radius:20px;padding:2px 8px;display:inline-block;margin:3px}.amount{white-space:nowrap}.apphead{display:flex;justify-content:space-between;gap:12px}.component{border-top:1px solid var(--line);padding:12px 0}.notice{border-left:4px solid var(--green);padding:6px 14px}label.proposal{display:block;border:1px solid var(--line);padding:14px;border-radius:10px;margin:12px 0}textarea{width:100%;min-height:120px}.tablewrap{overflow:auto}noscript{display:block;padding:20px} @media(max-width:480px){h1{font-size:26px}.panel,details{padding:14px}.apphead{display:block}.apphead .amount{display:block}td,th{padding:7px 3px;font-size:12px}}
+.standalone body{background:light-dark(#f8faf8,#111b16);padding:clamp(16px,3vw,36px)}.tools label{display:flex;flex-direction:column;gap:5px}.tools select{width:100%}
+</style></head><body><main>
+<div class="eyebrow">Opslagonderzoek · alleen meten</div><h1>Waar zit je opslag?</h1>
+<p>Bekijk de gemeten opslag per app, wat we weten over gebruik en welke keuzes nog onderzoek vragen.</p>
+<div class="notice">Dit rapport voert niets uit. Een selectie vraagt om een concreet opruimvoorstel. Verwijderen en apps stoppen vereisen afzonderlijke toestemming.</div>
+<div class="tools"><label>Omgeving <select id="context"></select></label><label>Zoek app of pad <input id="search" type="search" placeholder="Bijvoorbeeld Codex of sessions"></label></div>
+<div id="content"></div>
+<section id="review" data-lavish-question="storage-review"><h2>Voorstellen bespreken</h2><p>Alles staat standaard uit. Elk voorstel hoort exacte paden, gevolgen, bewijs en herstel te tonen.</p><div id="proposals"></div>
+<button id="request" type="button">Maak bespreekverzoek</button><p id="status" role="status"></p><textarea id="requestText" aria-label="Verzoek om te kopiëren" readonly placeholder="Je selectie verschijnt hier om te kopiëren naar de chat."></textarea></section>
+<noscript>JavaScript is nodig voor dit interactieve rapport. De bijbehorende JSON blijft leesbaar.</noscript>
+</main><script id="storage-data" type="application/json">__STORAGE_DATA__</script><script>
+'use strict';
+if(!getComputedStyle(document.documentElement).getPropertyValue('--background').trim())document.documentElement.classList.add('standalone');
+const data=JSON.parse(document.getElementById('storage-data').textContent);
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const size=n=>n==null?'onbekend':(Math.abs(n)>=1073741824?(n/1073741824).toFixed(2)+' GiB':(n/1048576).toFixed(1)+' MiB');
+const when=n=>n?new Date(n*1000).toLocaleDateString('nl-BE'):'onbekend';
+const select=document.getElementById('context');
+let appLimit=20;
+data.snapshots.forEach((s,i)=>{const o=document.createElement('option');o.value=i;o.textContent=s.host+' / '+s.platform+' / '+s.context;select.append(o)});
+function render(){
+ const s=data.snapshots[Number(select.value)],q=document.getElementById('search').value.toLowerCase();
+ const total=s.components.reduce((n,c)=>n+c.logical_bytes,0),max=Math.max(1,...s.apps.map(a=>a.logical_bytes));
+ let html='<h2>'+esc(s.host)+' <small>'+esc(s.context)+'</small></h2><p class="muted">Momentopname '+esc(s.captured_at)+' · '+esc(s.user)+' · '+esc(s.os)+'</p>';
+ html+='<p><strong>Onderzocht:</strong> '+s.coverage.map(c=>'<code>'+esc(c.root)+'</code>').join(', ')+'<br><small>'+s.coverage.filter(c=>!c.complete).length+' gedeeltelijke scans. Andere locaties zijn hiermee niet onderzocht.</small></p>';
+ html+='<div class="grid">'+s.volumes.map(v=>'<div class="panel"><small>'+esc(v.path)+(s.context!=='native'&&s.platform==='linux'?' · gastvolume':'')+'</small><div class="metric">'+size(v.free_bytes)+'</div><span>vrij van '+size(v.total_bytes)+'</span><div class="bar"><span style="width:'+Math.max(0,Math.min(100,100*(1-v.free_bytes/v.total_bytes)))+'%"></span></div></div>').join('')+'</div>';
+ html+='<p class="notice">'+size(total)+' aan logische bestandslengtes onderzocht. Dit is geen fysieke schijfmeting en geen gegarandeerde besparing. Windows en WSL blijven apart.</p>';
+ if(s.survey){
+  const v=s.volumes.find(v=>v.path.toLowerCase()===s.survey.root.toLowerCase());
+  html+='<h2>De volledige schijf</h2><p>'+s.survey.file_count.toLocaleString('nl-BE')+' bestanden bekeken vanaf <code>'+esc(s.survey.root)+'</code>. '+(v?'Het verschil tussen bezette schijfruimte en gevonden logische bestandslengtes is '+size(v.total_bytes-v.free_bytes-s.survey.logical_bytes)+'. ':'')+'Dat verschil bevat ook effecten van hardlinks, compressie, metadata en niet-toegankelijke data; het is geen exact gemeten map.</p><div id="diskTree" class="panel"></div>';
+ }
+ if(s.comparison.length)html+='<h2>Gemeten verschil</h2>'+s.comparison.map(c=>'<div class="panel"><h3>'+esc(c.volume)+'</h3><div class="metric">'+(c.free_delta>=0?'+':'')+size(c.free_delta)+'</div><p>Vrije ruimte: '+size(c.before_free)+' → '+size(c.after_free)+'</p><small>Sinds '+esc(c.before_at)+'. Achtergrondactiviteit kan bijdragen. WSL-gastruimte bewijst geen winst op C:.</small></div>').join('');
+ html+='<h2>Gemeten deel per app</h2><p class="muted">Installatie, sessies en caches staan bij elkaar als de eigenaar is vastgesteld. Niet-toegewezen data blijft zichtbaar. Geen volledige appomvang zolang onderdelen ontbreken.</p>';
+ const allApps=s.apps.filter(a=>(a.name+' '+a.components.map(c=>c.path).join(' ')).toLowerCase().includes(q));
+ const apps=allApps.slice(0,appLimit);
+ html+='<p>'+allApps.length+' groepen gevonden. De grootste '+apps.length+' staan hieronder. Zoek op een appnaam of pad om andere groepen te bekijken.</p>';
+ html+=apps.map(a=>'<details><summary><div class="apphead"><strong>'+esc(a.name)+'</strong><span class="amount">'+size(a.logical_bytes)+'</span></div><div class="bar"><span style="width:'+(100*a.logical_bytes/max)+'%"></span></div><small>'+a.components.length+' onderdelen · '+(a.running.length?'Uitvoering nu waargenomen':'Laatste gebruik onbekend')+'</small></summary>'+a.components.map(c=>'<div class="component"><span class="tag">'+esc(c.kind)+'</span> '+size(c.logical_bytes)+'<br><code>'+esc(c.path)+'</code><p><small>'+c.files+' bestanden · laatste bestandswijziging '+when(c.latest_mtime)+' · toegewezen blokken '+size(c.allocated_bytes)+'</small></p><small>ID '+esc(c.id)+'. Bucketmeting; dit pad is geen verwijderadvies. '+(c.boundary?'Bekende cachegrens, volledigheid en actief gebruik nog controleren.':'')+'</small></div>').join('')+'<p>Laatste menselijke gebruik: onbekend.</p>'+(a.execution.length?'<p>Uitvoering: '+esc(a.execution.map(e=>e.observed_at).join(', '))+'</p>':'')+(a.running.length?'<p>Actieve uitvoerbare paden:</p><pre>'+esc(a.running.map(p=>p.exe).join('\n'))+'</pre>':'')+'</details>').join('')||'<p>Geen resultaten.</p>';
+ if(allApps.length>apps.length)html+='<button type="button" id="moreApps">Toon 20 extra groepen</button>';
+ const cache=s.components.filter(c=>c.kind.includes('cache'));
+ html+='<h2>Verder onderzoeken</h2><p>'+cache.length+' cache- of runtimeonderdelen gevonden. Ook gedeelde runtimes kunnen actief zijn. Eerst herdownloadbaarheid, afhankelijkheden en gebruik controleren.</p>';
+ html+='<details><summary>Grote bestanden ('+s.large_files.length+')</summary>'+s.large_files.map(f=>'<div class="component">'+size(f.logical_bytes)+'<br><code>'+esc(f.path)+'</code></div>').join('')+'</details>';
+ if(s.packages)html+='<details><summary>Geïnstalleerde apps ('+s.packages.length+')</summary><p>Registerschattingen zijn geen totaalomvang. Installatiedatum is geen gebruiksdatum.</p><div class="tablewrap"><table><thead><tr><th>App / versie</th><th>Installatie</th><th>Schatting</th></tr></thead><tbody>'+s.packages.map(p=>'<tr><td>'+esc(p.name)+'<br><small>'+esc(p.version)+'</small></td><td>'+esc(p.install_date||'onbekend')+'<br><code>'+esc(p.install_location||'pad onbekend')+'</code></td><td>'+size(p.estimated_kib==null?null:p.estimated_kib*1024)+'</td></tr>').join('')+'</tbody></table></div></details>';
+ if(s.wsl_images?.length)html+='<details><summary>WSL-schijfbestanden op Windows</summary><p>Deze VHD-bestanden kunnen al in bovenstaande buckets zitten. Tel ze nooit nogmaals op bij de gastinhoud.</p>'+s.wsl_images.map(w=>'<div class="component">'+esc(w.distro)+' · '+size(w.logical_bytes)+'<br><code>'+esc(w.vhd_path)+'</code></div>').join('')+'</details>';
+ html+='<details><summary>Dekking en ontbrekend bewijs</summary>'+s.coverage.map(c=>'<p><code>'+esc(c.root)+'</code><br>'+(c.complete?'Gekozen scan afgerond':'Gedeeltelijk onderzocht')+' · '+c.files+' bestanden · '+c.errors+' fouten<br><small>'+esc(JSON.stringify(c.skipped))+'</small></p>').join('')+'<pre>'+esc(JSON.stringify(s.excluded_roots,null,2))+'</pre>'+s.limits.map(l=>'<p>'+esc(l)+'</p>').join('')+'</details>';
+ html+='<details><summary>Pakket-, service- en uitvoeringsbewijs</summary><p>Dit zijn uitvoerings- of installatiemetagegevens. Geen bewijs van menselijk gebruik. BAM-apparaatpaden vereisen een volumevertaling voordat ze bij Windows-apps kunnen worden gevoegd.</p><pre>'+esc(JSON.stringify({inventories:s.inventories,services:s.services,execution:s.execution},null,2))+'</pre></details>';
+ document.getElementById('content').innerHTML=html;
+ if(s.survey)renderTree(0);
+ if(document.getElementById('moreApps'))document.getElementById('moreApps').onclick=()=>{appLimit+=20;render()};
+}
+function renderTree(index){
+ const tree=data.snapshots[Number(select.value)].survey.directories,n=tree[index];
+ const children=tree.map((n,i)=>({n,i})).filter(x=>x.n.parent===index).sort((a,b)=>b.n.subtree_logical_bytes-a.n.subtree_logical_bytes);
+ const maximum=Math.max(1,...children.map(x=>x.n.subtree_logical_bytes));
+ const target=document.getElementById('diskTree');
+ target.innerHTML='<h3><code>'+esc(n.path)+'</code></h3><p>'+size(n.subtree_logical_bytes)+' logisch · '+n.errors+' toegangs-/leesfouten · '+n.skipped+' overgeslagen items</p>'+(n.parent>=0?'<button id="treeUp" type="button">Een map omhoog</button>':'')+'<p class="muted">Open een map voor de uitsplitsing. Submappen kleiner dan 50 MiB staan samen onderaan.</p>'+children.map(x=>'<div class="component"><div class="apphead"><button type="button" data-tree="'+x.i+'">'+esc(x.n.path.split('\\').filter(Boolean).pop())+'</button><strong>'+size(x.n.subtree_logical_bytes)+'</strong></div><div class="bar"><span style="width:'+(100*x.n.subtree_logical_bytes/maximum)+'%"></span></div></div>').join('')+'<p>Bestanden direct in deze map: '+size(n.direct_bytes)+'. Kleinere submappen: '+size(Math.max(0,n.subtree_logical_bytes-n.direct_bytes-children.reduce((sum,x)=>sum+x.n.subtree_logical_bytes,0)))+'.</p>';
+ target.querySelectorAll('[data-tree]').forEach(b=>b.onclick=()=>renderTree(Number(b.dataset.tree)));
+ if(n.parent>=0)document.getElementById('treeUp').onclick=()=>renderTree(n.parent);
+}
+document.getElementById('proposals').innerHTML=data.proposals.length?data.proposals.map((p,i)=>'<label class="proposal"><input type="checkbox" value="'+i+'"> <strong>'+esc(p.id)+' · '+esc(p.label)+'</strong><p>'+esc(p.impact)+'</p><code>'+esc(p.paths.join('\n'))+'</code><p>Herstel: '+esc(p.recovery)+'</p><small>Bewijs: '+esc(p.evidence)+'</small></label>').join(''):'<p>Er zijn nog geen onderbouwde opruimvoorstellen toegevoegd. De meetgegevens hierboven sturen het vervolgonderzoek.</p>';
+document.getElementById('request').onclick=()=>{
+ const items=[...document.querySelectorAll('#proposals input:checked')].map(e=>data.proposals[Number(e.value)]);
+ const text=items.length?'Werk een concreet opruimvoorstel uit voor elk van deze IDs. Dit is nog geen toestemming om te verwijderen, apps te stoppen of WSL te verkleinen.\n'+items.map(p=>p.id+' · '+p.label+'\n'+p.paths.join('\n')).join('\n\n'):'Selecteer eerst een voorstel.';
+ document.getElementById('requestText').value=text;
+ if(items.length&&window.lavish?.queuePrompt){window.lavish.queuePrompt(text,{tag:'storage-review',queueKey:'storage-review',data:{items:items.map(p=>({id:p.id,label:p.label,disposition:'proposal-only'}))}});document.getElementById('status').textContent='Bespreekverzoek klaargezet in Lavish. Nog niets uitgevoerd.'}
+ else document.getElementById('status').textContent=items.length?'Verzoek gemaakt. Kopieer het naar de chat.':'Geen selectie.';
+};
+select.onchange=()=>{appLimit=20;render()};document.getElementById('search').oninput=()=>{appLimit=20;render()};render();
+</script></body></html>

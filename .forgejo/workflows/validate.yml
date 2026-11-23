@@ -1,0 +1,54 @@
+name: Validate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: validate-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    # Keep the check name required by the existing main branch protection.
+    name: Validate store
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python for helper checks
+        run: |
+          set -eu
+          if ! command -v python3 >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y --no-install-recommends python3
+          fi
+          python3 --version
+      - uses: https://github.com/oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461
+        with:
+          bun-version: "1.4.4"
+      - name: Check skill metadata and local documentation links
+        run: |
+          set -eu
+          test "$(bun --version)" = "1.4.4"
+          bun test ./.forgejo/scripts/check-skills.test.mjs
+          bun .forgejo/scripts/check-skills.mjs
+      - name: Check collection helpers
+        run: |
+          set -eu
+          python3 -B skills/babysit-pr/scripts/test_forgejo.py
+          python3 -B skills/babysit-pr/scripts/test_github.py
+          python3 -B skills/watch-youtube/scripts/test_helpers.py
+          python3 -B skills/storage-audit/scripts/test_storage.py
+      - name: Check upstream watcher and plan helpers
+        working-directory: skills/poteto-mode/scripts
+        run: |
+          set -eu
+          test "$(bun --version)" = "1.4.4"
+          bun install --frozen-lockfile
+          bun run test
+          bun run typecheck
